@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Runtime logs / runs
+rag/runs/
+rag/*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,44 @@
+{
+    "project": "RAG_PoC",
+    "language": "ru",
+    "documents": [
+        {
+            "doc_id": "kid_aktsii_2025-12-30",
+            "title": "КИД ОПИФ РФИ «А-Капитал Акции»",
+            "type": "pdf",
+            "path": "D:\\Projects\\LLM_proj\\data\\kid\\aktsii_kid_2025-12-30.pdf",
+            "edition_date": "2025-12-30"
+        },
+        {
+            "doc_id": "rules_nav_2025-10-23",
+            "title": "Правила определения стоимости чистых активов «А-Капитал Акции»",
+            "type": "pdf",
+            "path": "D:\\Projects\\LLM_proj\\data\\rules_nav\\aktsii_rules_nav_2025-10-23.pdf",
+            "edition_date": "2025-10-23"
+        },
+        {
+            "doc_id": "rules_tm_2025-06-23",
+            "title": "Правила ДУ «А-Капитал Акции»",
+            "type": "docx",
+            "path": "D:\\Projects\\LLM_proj\\data\\rules_tm\\aktsii_rules_tm_2025-06-23.docx",
+            "edition_date": "2025-06-23"
+        }
+    ],
+    "ollama": {
+        "llm_model": "qwen2.5:7b-instruct-q4_K_M",
+        "embedding_model": "qwen3-embedding:4b"
+    },
+    "chunking": {
+        "strategy": "document_aware",
+        "max_chars": 3500,
+        "overlap_chars": 250
+    },
+    "retrieval": {
+        "top_k": 6
+    },
+    "answering": {
+        "not_found_policy": "low_retrieval_or_no_quote",
+        "min_similarity": 0.20,
+        "max_quote_chars": 800
+    } 
+}
