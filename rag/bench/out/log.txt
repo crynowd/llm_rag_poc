@@ -1,0 +1,8 @@
+[2026-02-10 17:30:02] validate_cases.py
+input: rag\bench\bench_cases_normalized.jsonl
+total_cases: 90
+base_cases: 30
+paraphrase_cases: 60
+not_found_cases: 0
+validation: OK
+
