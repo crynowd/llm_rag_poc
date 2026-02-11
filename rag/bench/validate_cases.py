@@ -84,9 +84,9 @@ def run(path: Path) -> int:
         print(f"ERROR: file not found: {path}")
         return 2
 
-    seen_ids = set()
     rows = []
     errors = []
+    seen_ids = set()
 
     with path.open("r", encoding="utf-8") as f:
         for idx, line in enumerate(f, 1):
@@ -98,8 +98,8 @@ def run(path: Path) -> int:
             except json.JSONDecodeError as e:
                 errors.append(f"line {idx}: invalid JSON: {e}")
                 continue
-            rows.append(obj)
 
+            rows.append(obj)
             cid = obj.get("case_id")
             if isinstance(cid, str):
                 if cid in seen_ids:
@@ -116,8 +116,8 @@ def run(path: Path) -> int:
         if src not in case_map:
             errors.append(f"case_id={r.get('case_id')}: source_case_id points to missing case: {src}")
             continue
-        src_row = case_map[src]
-        if src_row.get("source_case_id") is not None:
+        base = case_map[src]
+        if base.get("source_case_id") is not None:
             errors.append(
                 f"case_id={r.get('case_id')}: source_case_id must reference base case (source_case_id=null): {src}"
             )
@@ -126,11 +126,15 @@ def run(path: Path) -> int:
     base_count = sum(1 for r in rows if r.get("source_case_id") is None)
     para_count = total - base_count
     not_found_count = sum(
-        1 for r in rows if isinstance(r.get("expected"), dict) and r["expected"].get("type") == "not_found"
+        1
+        for r in rows
+        if isinstance(r.get("expected"), dict) and r["expected"].get("type") == "not_found"
     )
 
     expected_counter = Counter(
-        r.get("expected", {}).get("type") for r in rows if isinstance(r.get("expected"), dict)
+        r.get("expected", {}).get("type")
+        for r in rows
+        if isinstance(r.get("expected"), dict)
     )
     difficulty_counter = Counter(r.get("difficulty") for r in rows)
     tag_counter = Counter()
@@ -147,11 +151,17 @@ def run(path: Path) -> int:
     print(f"not_found_cases: {not_found_count}")
     print(
         "count_by_expected_type: "
-        + json.dumps({k: expected_counter.get(k, 0) for k in sorted(ALLOWED_EXPECTED_TYPES)}, ensure_ascii=False)
+        + json.dumps(
+            {k: expected_counter.get(k, 0) for k in sorted(ALLOWED_EXPECTED_TYPES)},
+            ensure_ascii=False,
+        )
     )
     print(
         "count_by_difficulty: "
-        + json.dumps({str(k): difficulty_counter.get(k, 0) for k in sorted(ALLOWED_DIFFICULTY)}, ensure_ascii=False)
+        + json.dumps(
+            {str(k): difficulty_counter.get(k, 0) for k in sorted(ALLOWED_DIFFICULTY)},
+            ensure_ascii=False,
+        )
     )
     print("top_tags_frequency:")
     for tag, cnt in tag_counter.most_common(10):
@@ -162,7 +172,7 @@ def run(path: Path) -> int:
         for err in errors[:100]:
             print(f"- {err}")
         if len(errors) > 100:
-            print(f"- ... and {len(errors)-100} more errors")
+            print(f"- ... and {len(errors) - 100} more errors")
         return 1
 
     print("validation: OK")
@@ -173,7 +183,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Validate normalized benchmark cases JSONL")
     parser.add_argument("--in", dest="input_path", required=True, help="Path to normalized JSONL")
     args = parser.parse_args()
-
     raise SystemExit(run(Path(args.input_path)))
 
 

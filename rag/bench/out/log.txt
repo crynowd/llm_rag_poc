@@ -6,3 +6,62 @@ paraphrase_cases: 60
 not_found_cases: 0
 validation: OK
 
+[2026-02-10 18:17:36] run_bench.py | start
+[2026-02-10 18:17:36] run_bench.py | cases=rag\bench\bench_cases_normalized.jsonl
+[2026-02-10 18:17:36] run_bench.py | out_jsonl=rag\bench\out\bench_run_result.jsonl
+[2026-02-10 18:17:36] run_bench.py | limit=None
+[2026-02-10 18:17:36] run_bench.py | shuffle_seed=0
+[2026-02-10 18:17:36] run_bench.py | cases_to_run=126
+[2026-02-10 18:17:52] run_bench.py | case=DU-001-A ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:18:08] run_bench.py | case=DU-001-P1 ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:18:30] run_bench.py | case=DU-001-P2 ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:18:46] run_bench.py | case=DU-002-A ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:19:01] run_bench.py | case=DU-002-P1 ok stop_reason=answered not_found=False retrieved=6 quotes=1
+[2026-02-10 18:19:17] run_bench.py | case=DU-002-P2 ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:19:46] run_bench.py | case=DU-003-A ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:20:10] run_bench.py | case=DU-003-P1 ok stop_reason=answered not_found=False retrieved=6 quotes=3
+[2026-02-10 18:20:35] run_bench.py | case=DU-003-P2 ok stop_reason=answered not_found=False retrieved=6 quotes=2
+[2026-02-11 09:41:15] run_bench.py | START run
+[2026-02-11 09:41:15] run_bench.py | timestamp_utc=2026-02-11T06:41:15.877757+00:00 cases=rag\bench\bench_cases_normalized.jsonl out_jsonl=rag\bench\out\bench_run_result.jsonl limit=2 seed=0
+[2026-02-11 09:41:15] run_bench.py | cases_to_run=2
+[2026-02-11 09:41:32] run_bench.py | case_id=DU-001-A status=OK duration_ms=16855
+[2026-02-11 09:41:49] run_bench.py | case_id=DU-001-P1 status=OK duration_ms=17073
+[2026-02-11 09:41:49] run_bench.py | done success=2 failed=0 not_found=0
+[2026-02-11 09:43:40] run_bench.py | START run
+[2026-02-11 09:43:40] run_bench.py | timestamp_utc=2026-02-11T06:43:40.062629+00:00 cases=rag\bench\bench_cases_normalized.jsonl out_jsonl=rag\bench\out\bench_run_result.jsonl limit=5 seed=0
+[2026-02-11 09:43:40] run_bench.py | cases_to_run=5
+[2026-02-11 09:43:54] run_bench.py | case_id=DU-001-A status=OK duration_ms=14123
+[2026-02-11 09:44:11] run_bench.py | case_id=DU-001-P1 status=OK duration_ms=17408
+[2026-02-11 09:44:35] run_bench.py | case_id=DU-001-P2 status=OK duration_ms=24367
+[2026-02-11 09:44:49] run_bench.py | case_id=DU-002-A status=OK duration_ms=13541
+[2026-02-11 09:45:02] run_bench.py | case_id=DU-002-P1 status=OK duration_ms=12648
+[2026-02-11 09:45:02] run_bench.py | done success=5 failed=0 not_found=0
+[2026-02-11 10:06:35] run_bench.py | START run
+[2026-02-11 10:06:35] run_bench.py | timestamp_utc=2026-02-11T07:06:35.400462+00:00 cases=rag\bench\bench_cases_normalized.jsonl out_jsonl=rag\bench\out\bench_run_result.jsonl limit=25 seed=0
+[2026-02-11 10:06:35] run_bench.py | cases_to_run=25
+[2026-02-11 10:06:57] run_bench.py | case_id=DU-001-A status=OK duration_ms=22541
+[2026-02-11 10:07:19] run_bench.py | case_id=DU-001-P1 status=OK duration_ms=22049
+[2026-02-11 10:07:41] run_bench.py | case_id=DU-001-P2 status=OK duration_ms=21969
+[2026-02-11 10:08:12] run_bench.py | case_id=DU-002-A status=OK duration_ms=30900
+[2026-02-11 10:08:26] run_bench.py | case_id=DU-002-P1 status=OK duration_ms=13161
+[2026-02-11 10:08:42] run_bench.py | case_id=DU-002-P2 status=OK duration_ms=16495
+[2026-02-11 10:09:11] run_bench.py | case_id=DU-003-A status=OK duration_ms=28682
+[2026-02-11 10:09:35] run_bench.py | case_id=DU-003-P1 status=OK duration_ms=23821
+[2026-02-11 10:10:00] run_bench.py | case_id=DU-003-P2 status=OK duration_ms=25833
+[2026-02-11 10:10:18] run_bench.py | case_id=DU-004-A status=OK duration_ms=17352
+[2026-02-11 10:10:30] run_bench.py | case_id=DU-004-P1 status=OK duration_ms=12594
+[2026-02-11 10:10:49] run_bench.py | case_id=DU-004-P2 status=OK duration_ms=18811
+[2026-02-11 10:11:06] run_bench.py | case_id=DU-005-A status=OK duration_ms=16924
+[2026-02-11 10:11:23] run_bench.py | case_id=DU-005-P1 status=OK duration_ms=16882
+[2026-02-11 10:11:28] run_bench.py | case_id=DU-005-P2 status=OK duration_ms=4982
+[2026-02-11 10:11:42] run_bench.py | case_id=DU-006-A status=OK duration_ms=13921
+[2026-02-11 10:11:57] run_bench.py | case_id=DU-006-P1 status=OK duration_ms=15406
+[2026-02-11 10:12:13] run_bench.py | case_id=DU-006-P2 status=OK duration_ms=15897
+[2026-02-11 10:12:28] run_bench.py | case_id=DU-007-A status=OK duration_ms=15337
+[2026-02-11 10:12:33] run_bench.py | case_id=DU-007-P1 status=OK duration_ms=4941
+[2026-02-11 10:12:36] run_bench.py | case_id=DU-007-P2 status=OK duration_ms=2142
+[2026-02-11 10:12:49] run_bench.py | case_id=DU-008-A status=OK duration_ms=13030
+[2026-02-11 10:13:08] run_bench.py | case_id=DU-008-P1 status=OK duration_ms=19105
+[2026-02-11 10:13:30] run_bench.py | case_id=DU-008-P2 status=OK duration_ms=22642
+[2026-02-11 10:13:51] run_bench.py | case_id=DU-009-A status=OK duration_ms=20522
+[2026-02-11 10:13:51] run_bench.py | done success=25 failed=0 not_found=8

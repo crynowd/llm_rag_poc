@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
-from utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
+from src.utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
 
 
 def split_pdf_text_to_blocks(text: str) -> List[str]:

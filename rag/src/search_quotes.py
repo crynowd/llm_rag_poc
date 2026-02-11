@@ -5,7 +5,7 @@ from typing import Any, Dict
 import numpy as np
 import faiss  # type: ignore
 
-from utils import load_json, load_jsonl
+from src.utils import load_json, load_jsonl
 from ollama_client import OllamaClient
 from quote_extractor import extract_best_quote
 

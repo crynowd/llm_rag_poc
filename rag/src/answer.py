@@ -5,9 +5,9 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import faiss  # type: ignore
 
-from utils import load_json, load_jsonl, make_run_dir, setup_logger
-from ollama_client import OllamaClient
-from quote_extractor import extract_best_quote
+from src.utils import load_json, load_jsonl, make_run_dir, setup_logger
+from src.ollama_client import OllamaClient
+from src.quote_extractor import extract_best_quote
 
 
 def load_meta(meta_path: str) -> Dict[str, Dict[str, Any]]:

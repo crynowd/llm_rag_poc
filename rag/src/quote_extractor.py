@@ -1,9 +1,9 @@
 import re
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
-# Очень упрощённый список русских стоп-слов (хватает для PoC)
+# Simplified Russian stopwords for PoC.
 RU_STOPWORDS = {
     "и", "в", "во", "на", "по", "к", "ко", "о", "об", "обо", "от", "до", "из", "у",
     "за", "для", "при", "без", "над", "под", "про", "через", "между",
@@ -12,10 +12,21 @@ RU_STOPWORDS = {
     "что", "чтобы", "которые", "который", "которых",
     "все", "всех", "вся", "всё", "всего",
     "может", "могут", "можно", "должен", "должна", "должны",
-    "включены", "включаться", "включен", "включает", "включают",  # спорно, но ок
+    "включены", "включаться", "включен", "включает", "включают",
 }
 
 WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+", re.UNICODE)
+
+# Soft penalty for frequent legal/technical tokens.
+NOISE_TOKENS = {
+    "договор",
+    "срок",
+    "дата",
+    "настоящими",
+    "правила",
+    "доверительного",
+    "управления",
+}
 
 
 @dataclass
@@ -38,7 +49,7 @@ def extract_query_terms(query: str, min_len: int = 3) -> List[str]:
         if w in RU_STOPWORDS:
             continue
         terms.append(w)
-    # уникализируем с сохранением порядка
+    # unique in order
     seen = set()
     uniq = []
     for t in terms:
@@ -49,13 +60,10 @@ def extract_query_terms(query: str, min_len: int = 3) -> List[str]:
 
 
 def split_sentences(text: str) -> List[str]:
-    # Простое разбиение по . ! ? + переносы, без NLP.
-    # Для нормативки обычно достаточно.
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
     parts = re.split(r"(?<=[.!?])\s+", text)
-    # ещё режем длинные куски по ; (часто в перечнях)
     out = []
     for p in parts:
         p = p.strip()
@@ -69,16 +77,34 @@ def split_sentences(text: str) -> List[str]:
     return out
 
 
-def sentence_score(sentence: str, terms: List[str]) -> Tuple[float, List[str]]:
+def sentence_score(
+    sentence: str,
+    terms: List[str],
+    term_freq: Dict[str, int],
+    noise_terms: List[str],
+) -> Tuple[float, List[str], int]:
     s_norm = normalize_word(sentence)
     hits = [t for t in terms if t in s_norm]
     if not hits:
-        return 0.0, []
-    # базовый скоринг: число попаданий + небольшой бонус за “плотность”
-    # (чтобы не побеждали огромные предложения ни о чём)
-    density = len(hits) / max(len(sentence), 1)
-    score = float(len(hits)) + 50.0 * density
-    return score, hits
+        return 0.0, [], 0
+
+    uniq_hits = set(hits)
+    coverage = len(uniq_hits)
+
+    # approx-IDF: rare terms in chunk weigh more
+    score = 0.0
+    for t in uniq_hits:
+        freq = term_freq.get(t, 1)
+        score += 1.0 / (1.0 + float(freq))
+
+    # soft penalty for frequent legal tokens not present in query terms
+    penalty = 0.0
+    for nt in noise_terms:
+        if nt in s_norm:
+            penalty += 0.1
+
+    score = score + (0.25 * coverage) - penalty
+    return score, hits, coverage
 
 
 def extract_best_quote(
@@ -88,31 +114,39 @@ def extract_best_quote(
     window_sentences: int = 2,
 ) -> QuoteCandidate:
     """
-    Ищем лучшие предложения по ключевым словам из запроса.
-    Возвращаем кусок из N предложений (окно вокруг лучшего).
-    Детерминированно.
+    Find best sentence by query terms and return windowed snippet.
+    Deterministic, no external deps.
     """
     terms = extract_query_terms(query)
-    sents = split_sentences(chunk_text)
+    term_set = set(terms)
+    noise_terms = [t for t in NOISE_TOKENS if t not in term_set]
 
+    # term frequencies within chunk for approx-IDF
+    chunk_words = [normalize_word(w) for w in WORD_RE.findall(chunk_text)]
+    term_freq: Dict[str, int] = {}
+    for w in chunk_words:
+        if w in term_set:
+            term_freq[w] = term_freq.get(w, 0) + 1
+
+    sents = split_sentences(chunk_text)
     best_idx = -1
     best = QuoteCandidate(text="", score=0.0, hit_words=[])
+    best_cov = 0
 
     for i, s in enumerate(sents):
-        sc, hits = sentence_score(s, terms)
-        if sc > best.score:
+        sc, hits, cov = sentence_score(s, terms, term_freq, noise_terms)
+        if sc > best.score or (sc == best.score and cov > best_cov):
             best = QuoteCandidate(text=s, score=sc, hit_words=hits)
             best_idx = i
+            best_cov = cov
 
     if best_idx == -1:
         return QuoteCandidate(text="", score=0.0, hit_words=[])
 
-    # окно вокруг лучшего предложения
     start = max(0, best_idx - (window_sentences - 1))
     end = min(len(sents), best_idx + window_sentences)
     snippet = " ".join(sents[start:end]).strip()
 
-    # режем по лимиту
     if len(snippet) > max_quote_chars:
         snippet = snippet[:max_quote_chars].rstrip() + "..."
 

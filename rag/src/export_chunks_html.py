@@ -1,5 +1,5 @@
 import os
-from utils import load_jsonl
+from src.utils import load_jsonl
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>

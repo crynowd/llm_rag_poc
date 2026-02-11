@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 import faiss  # type: ignore
 
-from utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
+from src.utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
 from ollama_client import OllamaClient
 
 
