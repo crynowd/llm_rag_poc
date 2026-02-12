@@ -12,3 +12,8 @@ rag/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+rag/data/index/
+rag/data/chunks/
+*.npy
+*.index
