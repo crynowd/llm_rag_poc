@@ -5,6 +5,39 @@ from tqdm import tqdm
 
 from utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
 
+import re
+
+def cleanup_pdf_text(t: str) -> str:
+    t = (t or "").replace("\r", "")
+    t = re.sub(r"[ \t]+", " ", t)
+
+    lines = [ln.strip() for ln in t.split("\n")]
+    out = []
+    for ln in lines:
+        if not ln:
+            out.append("")
+            continue
+        if not out:
+            out.append(ln)
+            continue
+
+        prev = out[-1]
+        # если перенос внутри предложения (предыдущая строка не закончена) — склеиваем
+        if prev and not prev.endswith((".", "!", "?", ":", ";")) and re.match(r"^[а-яa-z]", ln):
+            out[-1] = prev + " " + ln
+        else:
+            out.append(ln)
+
+    t = "\n".join(out)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+def split_into_paragraphs(t: str) -> list[str]:
+    # Сначала режем по пустым строкам
+    paras = [p.strip() for p in re.split(r"\n\s*\n", t) if p.strip()]
+    return paras
+
 
 def split_pdf_text_to_blocks(text: str) -> List[str]:
     # Простое разбиение "как абзацы": двойной перенос строки.
@@ -26,10 +59,17 @@ def flatten_segments_for_chunking(rows: List[Dict[str, Any]]) -> List[Dict[str, 
             continue
 
         if r.get("doc_type") == "pdf":
-            for b in split_pdf_text_to_blocks(txt):
-                out.append({**r, "text": b})
+            cleaned = cleanup_pdf_text(txt)
+            paras = split_into_paragraphs(cleaned)
+
+            for i, para in enumerate(paras, start=1):
+                if len(para.strip()) < 20:
+                    continue
+                # сохраняем para_idx как локальную нумерацию абзацев внутри страницы
+                out.append({**r, "text": para, "para_idx": i})
         else:
             out.append(r)
+
     return out
 
 
