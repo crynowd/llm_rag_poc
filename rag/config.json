@@ -30,6 +30,8 @@
     },
     "chunking": {
         "strategy": "document_aware",
+        "pdf_chunker": "llm",
+        "pdf_llm_target_chars": 1200,
         "max_chars": 3500,
         "overlap_chars": 250
     },

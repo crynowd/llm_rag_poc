@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
+from ollama_client import OllamaClient
 
 import re
 
@@ -45,13 +46,72 @@ def split_pdf_text_to_blocks(text: str) -> List[str]:
     blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
     return blocks
 
+import json
 
-def flatten_segments_for_chunking(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def llm_split_into_segments(client, model: str, page_text: str, target_chars: int = 1200) -> list[str]:
+    system = (
+        "Ты инструмент для разметки текста. "
+        "НЕЛЬЗЯ переписывать, исправлять, сокращать или добавлять текст. "
+        "Нужно ТОЛЬКО разбить исходный текст на смысловые сегменты."
+    )
+
+    prompt = f"""
+Разбей текст на сегменты (примерно {target_chars}–{target_chars*2} символов каждый), сохраняя исходный текст ПОСИМВОЛЬНО.
+Верни строго JSON вида:
+{{"segments": ["...", "...", ...]}}
+
+Текст:
+<<<
+{page_text}
+>>>
+"""
+
+    raw = client.generate(model=model, prompt=prompt, system=system, temperature=0.0).strip()
+
+    # вытащим JSON (на случай если модель добавила мусор вокруг)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return []
+
+    try:
+        obj = json.loads(raw[start:end+1])
+    except Exception:
+        return []
+
+    segs = obj.get("segments")
+    if not isinstance(segs, list):
+        return []
+
+    # фильтруем: сегмент должен быть подстрокой исходного текста
+    ok = []
+    for s in segs:
+        if not isinstance(s, str):
+            continue
+        s = s.strip()
+        if len(s) < 50:
+            continue
+        if s in page_text:
+            ok.append(s)
+
+    return ok
+
+def flatten_segments_for_chunking(
+    rows: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    client: Optional["OllamaClient"] = None,
+) -> List[Dict[str, Any]]:
     """
     Приводит сегменты в единый список 'атомов' для чанкинга:
-    - PDF: страница -> список абзацев (blocks)
+    - PDF: страница -> список сегментов (heuristic или LLM)
     - DOCX: абзац/строка таблицы как есть
     """
+    chunking_cfg = cfg.get("chunking", {}) if isinstance(cfg, dict) else {}
+    pdf_chunker = chunking_cfg.get("pdf_chunker", "heuristic")  # "heuristic" | "llm"
+    target_chars = int(chunking_cfg.get("pdf_llm_target_chars", 1200))
+
+    llm_model = (cfg.get("ollama", {}) or {}).get("llm_model")
+
     out: List[Dict[str, Any]] = []
     for r in rows:
         txt = (r.get("text") or "").strip()
@@ -60,17 +120,34 @@ def flatten_segments_for_chunking(rows: List[Dict[str, Any]]) -> List[Dict[str, 
 
         if r.get("doc_type") == "pdf":
             cleaned = cleanup_pdf_text(txt)
-            paras = split_into_paragraphs(cleaned)
 
+            # --- LLM-aware chunking (если включено и есть client/model) ---
+            if pdf_chunker == "llm" and client is not None and llm_model:
+                segs = llm_split_into_segments(
+                    client=client,
+                    model=llm_model,
+                    page_text=cleaned,
+                    target_chars=target_chars,
+                )
+                if segs:
+                    for i, seg in enumerate(segs, start=1):
+                        if len(seg.strip()) < 20:
+                            continue
+                        out.append({**r, "text": seg, "para_idx": i})
+                    continue  # важно: не падать в heuristic ниже
+
+            # --- fallback: heuristic ---
+            paras = split_into_paragraphs(cleaned)
             for i, para in enumerate(paras, start=1):
                 if len(para.strip()) < 20:
                     continue
-                # сохраняем para_idx как локальную нумерацию абзацев внутри страницы
                 out.append({**r, "text": para, "para_idx": i})
+
         else:
             out.append(r)
 
     return out
+
 
 
 def make_chunk_id(doc_id: str, idx: int) -> str:
@@ -194,7 +271,11 @@ def main() -> None:
         doc_type = rows[0].get("doc_type")
         logger.info(f"doc_start doc_id={doc_id} doc_type={doc_type} segments={len(rows)}")
 
-        atoms = flatten_segments_for_chunking(rows)
+        pdf_chunker = cfg.get("chunking", {}).get("pdf_chunker", "heuristic")
+        client = OllamaClient() if pdf_chunker == "llm" else None
+
+        atoms = flatten_segments_for_chunking(rows, cfg=cfg, client=client)
+
         logger.info(f"doc_atoms doc_id={doc_id} atoms={len(atoms)}")
 
         doc_chunks = chunk_atoms(atoms, max_chars=max_chars, overlap_chars=overlap_chars)
