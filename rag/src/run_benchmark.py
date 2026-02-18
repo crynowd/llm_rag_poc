@@ -8,7 +8,6 @@ import faiss  # type: ignore
 
 from utils import load_json, load_jsonl, write_jsonl, make_run_dir, setup_logger
 from ollama_client import OllamaClient
-from quote_extractor import extract_best_quote
 
 
 def load_meta(meta_path: str) -> Dict[str, Dict[str, Any]]:
@@ -18,25 +17,26 @@ def load_meta(meta_path: str) -> Dict[str, Dict[str, Any]]:
     return meta
 
 
-def build_prompt(query: str, quotes: List[Dict[str, Any]]) -> Tuple[str, str]:
+def build_prompt(query: str, chunks: List[Dict[str, Any]]) -> Tuple[str, str]:
     """
     Возвращает (system, user_prompt).
+    Передаём в LLM НЕ "цитаты", а найденные ЧАНКИ (или их обрезанную часть).
     """
     system = (
         "Ты корпоративный ассистент по нормативным документам. "
-        "Ты ОБЯЗАН отвечать ТОЛЬКО на основе предоставленных цитат. "
+        "Ты ОБЯЗАН отвечать ТОЛЬКО на основе предоставленного контекста. "
         "НЕЛЬЗЯ добавлять новые факты, интерпретации, предположения. "
-        "Если ответа нет в цитатах, верни ровно: NOT_FOUND. "
+        "Если ответа нет в контексте, верни ровно: NOT_FOUND. "
         "Не смешивай документы и редакции, используй только то, что дано."
     )
 
-    blocks = []
-    for i, q in enumerate(quotes, start=1):
-        src = q["source"]
+    blocks: List[str] = []
+    for i, c in enumerate(chunks, start=1):
+        src = c["source"]
         blocks.append(
-            f"[Q{i}] SOURCE: doc_id={src.get('doc_id')}; chunk_id={src.get('chunk_id')}; "
+            f"[C{i}] SOURCE: doc_id={src.get('doc_id')}; chunk_id={src.get('chunk_id')}; "
             f"pages={src.get('pages')}; paras={src.get('paras')}\n"
-            f"QUOTE:\n{q.get('quote','')}"
+            f"CHUNK:\n{c.get('text','')}"
         )
 
     context = "\n\n".join(blocks)
@@ -44,22 +44,21 @@ def build_prompt(query: str, quotes: List[Dict[str, Any]]) -> Tuple[str, str]:
     user = f"""ВОПРОС:
 {query}
 
-ЦИТАТЫ (единственный источник истины):
+КОНТЕКСТ (единственный источник истины):
 {context}
 
 ЗАДАНИЕ:
 1) Дай краткий ответ на русском.
-2) В конце укажи, какие цитаты использовал: [Q1], [Q2]...
-3) Если в цитатах нет прямого ответа на вопрос, верни ровно: NOT_FOUND.
+2) В конце укажи, какие фрагменты использовал: [C1], [C2]...
+3) Если в контексте нет прямого ответа на вопрос, верни ровно: NOT_FOUND.
 Формат:
 - Ответ: ...
-- Основание: [Q...]
+- Основание: [C...]
 """
     return system, user
 
 
 def normalize_text(s: str) -> str:
-    # Для логов/сравнений: убираем лишние пробелы
     return " ".join((s or "").split()).strip()
 
 
@@ -108,22 +107,22 @@ def save_case_markdown(path: str, payload: Dict[str, Any]) -> None:
     lines.append(payload.get("answer", ""))
     lines.append("```")
     lines.append("")
-    lines.append("## Quotes passed to LLM")
+    lines.append("## Chunks passed to LLM")
     lines.append("")
-    quotes = payload.get("quotes", [])
-    if not quotes:
-        lines.append("_No quotes_")
+    chunks = payload.get("chunks", [])
+    if not chunks:
+        lines.append("_No chunks_")
     else:
-        for q in quotes:
-            src = q.get("source", {})
+        for c in chunks:
+            src = c.get("source", {})
             lines.append(
-                f"- **chunk_id:** `{q.get('chunk_id')}` | **doc_id:** `{src.get('doc_id')}` | "
+                f"- **chunk_id:** `{c.get('chunk_id')}` | **doc_id:** `{src.get('doc_id')}` | "
                 f"**pages:** `{src.get('pages')}` | **paras:** `{src.get('paras')}` | "
-                f"**sim:** {q.get('similarity'):.4f} | **quote_score:** {q.get('quote_score'):.2f}"
+                f"**sim:** {c.get('similarity'):.4f}"
             )
             lines.append("")
             lines.append("```")
-            lines.append(q.get("quote", "").strip())
+            lines.append((c.get("text", "") or "").strip())
             lines.append("```")
             lines.append("")
     lines.append("## Retrieval (top)")
@@ -159,13 +158,31 @@ def save_case_markdown(path: str, payload: Dict[str, Any]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", required=True, help="Path to cases.jsonl")
+    ap.add_argument(
+        "--doc_id",
+        default=None,
+        help="Restrict retrieval to a single document doc_id for ALL cases (variant A). "
+             "If set, overrides case.doc_id and enables restriction automatically.",
+    )
     ap.add_argument("--k", type=int, default=None, help="top_k retrieval (override config)")
-    ap.add_argument("--max_quotes", type=int, default=3, help="How many quotes to pass to LLM")
+    ap.add_argument(
+        "--max_chunks",
+        type=int,
+        default=5,
+        help="How many chunks to pass to LLM (replaces max_quotes / quote_extractor).",
+    )
+    ap.add_argument(
+        "--max_chunk_chars",
+        type=int,
+        default=None,
+        help="Trim each chunk to at most this many characters before passing to LLM "
+             "(override answering.max_quote_chars if present).",
+    )
     ap.add_argument("--limit", type=int, default=None, help="Limit number of cases to run")
     ap.add_argument(
         "--restrict_doc",
         action="store_true",
-        help="Restrict retrieved chunks to case.doc_id (recommended for this benchmark)",
+        help="Restrict retrieved chunks to case.doc_id (or --doc_id override).",
     )
     ap.add_argument(
         "--no_restrict_doc",
@@ -175,14 +192,14 @@ def main() -> None:
     ap.add_argument(
         "--k_search_multiplier",
         type=int,
-        default=10,
-        help="Retrieve k*k_search_multiplier candidates from FAISS before filtering",
+        default=50,
+        help="Retrieve k*k_search_multiplier candidates from FAISS before filtering (default raised).",
     )
     ap.add_argument(
         "--min_similarity",
         type=float,
         default=None,
-        help="Override answering.min_similarity from config",
+        help="Override answering.min_similarity from config (used only as a weak gate).",
     )
     args = ap.parse_args()
 
@@ -204,32 +221,37 @@ def main() -> None:
         if args.min_similarity is not None
         else float(cfg["answering"]["min_similarity"])
     )
-    max_quote_chars = int(cfg["answering"]["max_quote_chars"])
+    # Reuse existing config param as default trimming budget
+    cfg_trim = int(cfg.get("answering", {}).get("max_quote_chars", 1200))
+    max_chunk_chars = int(args.max_chunk_chars) if args.max_chunk_chars is not None else cfg_trim
 
     restrict_doc = False
-    if args.no_restrict_doc:
+    if args.doc_id:
+        restrict_doc = True
+    elif args.no_restrict_doc:
         restrict_doc = False
     elif args.restrict_doc:
         restrict_doc = True
     else:
-        # дефолт: без ограничения, чтобы поведение соответствовало твоему текущему пайплайну
         restrict_doc = False
 
     logger.info("=== BENCHMARK RUN START ===")
     logger.info(f"run_dir={run_dir}")
     logger.info(f"cases_path={args.cases}")
+    logger.info(f"doc_id_override={args.doc_id}")
     logger.info(f"embed_model={embed_model} llm_model={llm_model}")
-    logger.info(f"top_k={top_k} max_quotes={args.max_quotes}")
-    logger.info(f"min_similarity={min_similarity} max_quote_chars={max_quote_chars}")
-    logger.info(f"restrict_doc={restrict_doc}")
+    logger.info(f"top_k={top_k} max_chunks={args.max_chunks}")
+    logger.info(f"min_similarity={min_similarity} max_chunk_chars={max_chunk_chars}")
+    logger.info(f"restrict_doc={restrict_doc} k_search_multiplier={args.k_search_multiplier}")
 
-    # snapshot config + args
     with open(os.path.join(run_dir, "run_args.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
                 "cases": args.cases,
+                "doc_id": args.doc_id,
                 "k": top_k,
-                "max_quotes": args.max_quotes,
+                "max_chunks": args.max_chunks,
+                "max_chunk_chars": max_chunk_chars,
                 "limit": args.limit,
                 "restrict_doc": restrict_doc,
                 "k_search_multiplier": args.k_search_multiplier,
@@ -257,29 +279,26 @@ def main() -> None:
         ids = [line.strip() for line in f if line.strip()]
     index = faiss.read_index(faiss_path)
 
-    # Precompute chunk_id -> doc_id for filtering
     chunk_doc: Dict[str, Optional[str]] = {cid: meta.get(cid, {}).get("doc_id") for cid in ids}
 
-    # Load cases
     cases = load_jsonl(args.cases)
     if args.limit is not None:
         cases = cases[: max(0, int(args.limit))]
 
-    # init Ollama
     client = OllamaClient()
 
     out_rows: List[Dict[str, Any]] = []
     md_dir = os.path.join(run_dir, "cases_md")
     os.makedirs(md_dir, exist_ok=True)
 
-    k_search = min(len(ids), max(top_k * int(args.k_search_multiplier), top_k))
-
+    # Pull lots of candidates before filtering (esp. for restrict_doc)
+    k_search = min(len(ids), max(top_k * int(args.k_search_multiplier), 500 if restrict_doc else top_k))
     logger.info(f"cases_total={len(cases)} k_search={k_search}")
 
     for n, case in enumerate(cases, start=1):
         cid = case.get("id", f"case_{n:04d}")
         query = str(case.get("query", "")).strip()
-        target_doc_id = case.get("doc_id")
+        target_doc_id = args.doc_id if args.doc_id else case.get("doc_id")
         expect_nf = bool(case.get("expect_not_found", False))
 
         logger.info(f"[{n}/{len(cases)}] case_id={cid} target_doc_id={target_doc_id}")
@@ -292,32 +311,25 @@ def main() -> None:
             "gold": case.get("gold", {}),
             "gold_evidence": case.get("gold_evidence", {}),
             "retrieved": [],
-            "quotes": [],
+            "chunks": [],
             "answer": "",
             "status": "OK",
             "notes": [],
         }
 
         try:
-            # Embed query
             qvec = client.embed_one(embed_model, query)
 
-            # Retrieve candidates
             retrieved_all = retrieve_candidates(index, ids, qvec, k_search)
 
-            # Optional filter by doc_id (benchmark-focused)
             retrieved = retrieved_all
             if restrict_doc and target_doc_id:
-                filtered = [(ch, sc) for (ch, sc) in retrieved_all if chunk_doc.get(ch) == target_doc_id]
-                if filtered:
-                    retrieved = filtered
-                else:
-                    case_payload["notes"].append("No chunks after doc_id filter; falling back to unfiltered.")
-                    retrieved = retrieved_all
+                retrieved = [(ch, sc) for (ch, sc) in retrieved_all if chunk_doc.get(ch) == target_doc_id]
+                if not retrieved:
+                    case_payload["notes"].append("No chunks after doc_id filter (strict restrict_doc).")
 
             retrieved = retrieved[:top_k]
 
-            # Save retrieval info
             for ch_id, sim in retrieved:
                 m = meta.get(ch_id, {})
                 pages, paras = format_where(m)
@@ -335,37 +347,27 @@ def main() -> None:
                     }
                 )
 
-            # NOT_FOUND if retrieval too weak
             if not retrieved or retrieved[0][1] < min_similarity:
                 case_payload["answer"] = "NOT_FOUND"
-                case_payload["status"] = "NOT_FOUND_LOW_SIM"
+                case_payload["status"] = "NOT_FOUND_EMPTY_RETRIEVAL"
                 out_rows.append(case_payload)
                 save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
                 continue
 
-            # Extract quotes
-            quotes: List[Dict[str, Any]] = []
-            for ch_id, sim in retrieved:
-                full_text = chunk_text_by_id.get(ch_id, "")
-                qc = extract_best_quote(
-                    chunk_text=full_text,
-                    query=query,
-                    max_quote_chars=max_quote_chars,
-                    window_sentences=2,
-                )
-                if not qc.text:
-                    continue
-
+            # Pass full chunks (trimmed) to LLM, NO quote_extractor
+            chunks_for_llm: List[Dict[str, Any]] = []
+            for ch_id, sim in retrieved[: max(1, int(args.max_chunks))]:
+                full_text = chunk_text_by_id.get(ch_id, "") or ""
+                text = full_text.strip()
+                if max_chunk_chars and len(text) > max_chunk_chars:
+                    text = text[:max_chunk_chars].rstrip() + "\n…"
                 m = meta.get(ch_id, {})
                 pages, paras = format_where(m)
-
-                quotes.append(
+                chunks_for_llm.append(
                     {
                         "chunk_id": ch_id,
                         "similarity": float(sim),
-                        "quote_score": float(qc.score),
-                        "hit_words": list(qc.hit_words),
-                        "quote": qc.text,
+                        "text": text,
                         "source": {
                             "doc_id": m.get("doc_id"),
                             "chunk_id": ch_id,
@@ -375,21 +377,16 @@ def main() -> None:
                     }
                 )
 
-            if not quotes:
+            if not chunks_for_llm:
                 case_payload["answer"] = "NOT_FOUND"
-                case_payload["status"] = "NOT_FOUND_NO_QUOTES"
+                case_payload["status"] = "NOT_FOUND_NO_CHUNKS"
                 out_rows.append(case_payload)
                 save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
                 continue
 
-            # Pick best quotes: by similarity then quote_score
-            quotes.sort(key=lambda x: (x["similarity"], x["quote_score"]), reverse=True)
-            quotes = quotes[: max(1, int(args.max_quotes))]
+            case_payload["chunks"] = chunks_for_llm
 
-            case_payload["quotes"] = quotes
-
-            # Generate answer
-            system, prompt = build_prompt(query, quotes)
+            system, prompt = build_prompt(query, chunks_for_llm)
             answer = client.generate(
                 model=llm_model,
                 prompt=prompt,
@@ -399,13 +396,12 @@ def main() -> None:
 
             case_payload["answer"] = answer
 
-            # Minimal format sanity checks (только пометки, не ломаем прогон)
             a_norm = normalize_text(answer)
             if a_norm != "NOT_FOUND":
                 if "Основание:" not in answer:
                     case_payload["notes"].append("Answer missing 'Основание:' line (format drift).")
-                if "[Q" not in answer:
-                    case_payload["notes"].append("Answer does not reference [Q...] (format drift).")
+                if "[C" not in answer:
+                    case_payload["notes"].append("Answer does not reference [C...] (format drift).")
 
             out_rows.append(case_payload)
             save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
@@ -418,11 +414,9 @@ def main() -> None:
             save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
             logger.exception(f"case_id={cid} failed")
 
-    # Save outputs
     results_path = os.path.join(run_dir, "results.jsonl")
     write_jsonl(results_path, out_rows)
 
-    # A compact summary
     total = len(out_rows)
     n_ok = sum(1 for r in out_rows if r.get("status") == "OK")
     n_nf = sum(1 for r in out_rows if str(r.get("answer", "")).strip() == "NOT_FOUND")

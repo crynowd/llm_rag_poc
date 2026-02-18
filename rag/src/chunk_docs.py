@@ -4,9 +4,99 @@ from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from utils import ensure_dir, load_json, load_jsonl, make_run_dir, setup_logger, write_jsonl
-from ollama_client import OllamaClient
 
 import re
+
+# --- PDF sentence-based chunking helpers ---
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """Naive sentence splitter for PDF text.
+
+    PDF is messy (numbering, abbreviations). We'll add a guardrail later.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    text = re.sub(r"\s+", " ", text).strip()
+    sents = _SENT_SPLIT_RE.split(text)
+    out: List[str] = []
+    for s in sents:
+        s = s.strip()
+        if len(s) >= 2:
+            out.append(s)
+    return out
+
+
+def pack_sentences(sentences: List[str], max_chars: int, overlap_chars: int) -> List[str]:
+    """Pack sentences into chunks up to max_chars.
+
+    Overlap is implemented via *carry-over sentences* (no index backtracking)
+    to avoid infinite loops.
+    """
+    if not sentences:
+        return []
+
+    chunks: List[str] = []
+    i = 0
+    n = len(sentences)
+    carry: List[str] = []
+
+    while i < n:
+        start_i = i
+
+        buf: List[str] = list(carry)
+        buf_len = len(" ".join(buf)) if buf else 0
+
+        while i < n:
+            s = (sentences[i] or "").strip()
+            if not s:
+                i += 1
+                continue
+
+            # If chunk is empty and sentence itself is too long, keep it whole.
+            if not buf and len(s) > max_chars:
+                buf = [s]
+                buf_len = len(s)
+                i += 1
+                break
+
+            add_len = len(s) + (1 if buf else 0)
+            if buf_len + add_len <= max_chars:
+                buf.append(s)
+                buf_len += add_len
+                i += 1
+                continue
+            break
+
+        # Safety: ensure forward progress
+        if i == start_i and i < n:
+            s = (sentences[i] or "").strip()
+            if s:
+                buf = [s]
+            i += 1
+
+        chunk_text = " ".join([x for x in buf if x]).strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+
+        if overlap_chars and overlap_chars > 0:
+            carry = []
+            carry_len = 0
+            for s in reversed(buf):
+                if not s:
+                    continue
+                carry.append(s)
+                carry_len += len(s) + 1
+                if carry_len >= overlap_chars:
+                    break
+            carry = list(reversed(carry))
+        else:
+            carry = []
+
+    return chunks
 
 def cleanup_pdf_text(t: str) -> str:
     t = (t or "").replace("\r", "")
@@ -46,108 +136,56 @@ def split_pdf_text_to_blocks(text: str) -> List[str]:
     blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
     return blocks
 
-import json
-
-def llm_split_into_segments(client, model: str, page_text: str, target_chars: int = 1200) -> list[str]:
-    system = (
-        "Ты инструмент для разметки текста. "
-        "НЕЛЬЗЯ переписывать, исправлять, сокращать или добавлять текст. "
-        "Нужно ТОЛЬКО разбить исходный текст на смысловые сегменты."
-    )
-
-    prompt = f"""
-Разбей текст на сегменты (примерно {target_chars}–{target_chars*2} символов каждый), сохраняя исходный текст ПОСИМВОЛЬНО.
-Верни строго JSON вида:
-{{"segments": ["...", "...", ...]}}
-
-Текст:
-<<<
-{page_text}
->>>
-"""
-
-    raw = client.generate(model=model, prompt=prompt, system=system, temperature=0.0).strip()
-
-    # вытащим JSON (на случай если модель добавила мусор вокруг)
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return []
-
-    try:
-        obj = json.loads(raw[start:end+1])
-    except Exception:
-        return []
-
-    segs = obj.get("segments")
-    if not isinstance(segs, list):
-        return []
-
-    # фильтруем: сегмент должен быть подстрокой исходного текста
-    ok = []
-    for s in segs:
-        if not isinstance(s, str):
-            continue
-        s = s.strip()
-        if len(s) < 50:
-            continue
-        if s in page_text:
-            ok.append(s)
-
-    return ok
 
 def flatten_segments_for_chunking(
     rows: List[Dict[str, Any]],
+    *,
     cfg: Dict[str, Any],
-    client: Optional["OllamaClient"] = None,
+    logger,
 ) -> List[Dict[str, Any]]:
     """
     Приводит сегменты в единый список 'атомов' для чанкинга:
-    - PDF: страница -> список сегментов (heuristic или LLM)
+    - PDF: страница -> список абзацев (blocks)
     - DOCX: абзац/строка таблицы как есть
     """
-    chunking_cfg = cfg.get("chunking", {}) if isinstance(cfg, dict) else {}
-    pdf_chunker = chunking_cfg.get("pdf_chunker", "heuristic")  # "heuristic" | "llm"
-    target_chars = int(chunking_cfg.get("pdf_llm_target_chars", 1200))
-
-    llm_model = (cfg.get("ollama", {}) or {}).get("llm_model")
-
     out: List[Dict[str, Any]] = []
+
+    ch_cfg = cfg.get("chunking", {})
+    pdf_max_chars = int(ch_cfg.get("pdf_max_chars", 1400))
+    pdf_overlap_chars = int(ch_cfg.get("pdf_overlap_chars", 200))
+
+    pdf_total = sum(1 for x in rows if x.get("doc_type") == "pdf")
+    pdf_seen = 0
+
     for r in rows:
         txt = (r.get("text") or "").strip()
         if not txt:
             continue
 
         if r.get("doc_type") == "pdf":
+            pdf_seen += 1
+            if pdf_total and (pdf_seen % 10 == 0 or pdf_seen == pdf_total):
+                logger.info(f"pdf_progress doc_id={r.get('doc_id')} page={pdf_seen}/{pdf_total}")
+
             cleaned = cleanup_pdf_text(txt)
+            sents = split_into_sentences(cleaned)
 
-            # --- LLM-aware chunking (если включено и есть client/model) ---
-            if pdf_chunker == "llm" and client is not None and llm_model:
-                segs = llm_split_into_segments(
-                    client=client,
-                    model=llm_model,
-                    page_text=cleaned,
-                    target_chars=target_chars,
+            # Guardrail: sentence splitter may explode on numbering/abbrev.
+            if len(sents) > 5000:
+                logger.info(
+                    f"too_many_sentences doc_id={r.get('doc_id')} page={r.get('page')} sentences={len(sents)} "
+                    f"text_len={len(cleaned)} -> fallback paragraphs"
                 )
-                if segs:
-                    for i, seg in enumerate(segs, start=1):
-                        if len(seg.strip()) < 20:
-                            continue
-                        out.append({**r, "text": seg, "para_idx": i})
-                    continue  # важно: не падать в heuristic ниже
+                sents = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
 
-            # --- fallback: heuristic ---
-            paras = split_into_paragraphs(cleaned)
-            for i, para in enumerate(paras, start=1):
-                if len(para.strip()) < 20:
+            pieces = pack_sentences(sents, max_chars=pdf_max_chars, overlap_chars=pdf_overlap_chars)
+            for i, piece in enumerate(pieces, start=1):
+                if len(piece.strip()) < 20:
                     continue
-                out.append({**r, "text": para, "para_idx": i})
-
+                out.append({**r, "text": piece, "para_idx": i})
         else:
             out.append(r)
-
     return out
-
 
 
 def make_chunk_id(doc_id: str, idx: int) -> str:
@@ -250,11 +288,14 @@ def main() -> None:
     logger.info("=== CHUNKING START ===")
 
     cfg = load_json(os.path.join(project_dir, "config.json"))
-    max_chars = int(cfg["chunking"]["max_chars"])
-    overlap_chars = int(cfg["chunking"]["overlap_chars"])
+    ch_cfg = cfg.get("chunking", {})
 
-    logger.info(f"chunking.max_chars={max_chars}")
-    logger.info(f"chunking.overlap_chars={overlap_chars}")
+    # global defaults
+    max_chars_default = int(ch_cfg.get("max_chars", 3500))
+    overlap_default = int(ch_cfg.get("overlap_chars", 250))
+
+    logger.info(f"chunking.max_chars={max_chars_default}")
+    logger.info(f"chunking.overlap_chars={overlap_default}")
 
     parsed_path = os.path.join(project_dir, "data", "parsed", "parsed.jsonl")
     parsed = load_jsonl(parsed_path)
@@ -271,20 +312,30 @@ def main() -> None:
         doc_type = rows[0].get("doc_type")
         logger.info(f"doc_start doc_id={doc_id} doc_type={doc_type} segments={len(rows)}")
 
-        pdf_chunker = cfg.get("chunking", {}).get("pdf_chunker", "heuristic")
-        client = OllamaClient() if pdf_chunker == "llm" else None
+        # per-doc params
+        if doc_type == "pdf":
+            max_chars = int(ch_cfg.get("pdf_max_chars", max_chars_default))
+            # overlap for PDFs is handled inside sentence packing -> avoid double overlap here
+            overlap = 0
+        elif doc_type == "docx":
+            max_chars = int(ch_cfg.get("docx_max_chars", max_chars_default))
+            overlap = int(ch_cfg.get("docx_overlap_chars", overlap_default))
+        else:
+            max_chars = max_chars_default
+            overlap = overlap_default
 
-        atoms = flatten_segments_for_chunking(rows, cfg=cfg, client=client)
+        logger.info(f"chunk_params doc_id={doc_id} doc_type={doc_type} max_chars={max_chars} overlap={overlap}")
 
+        atoms = flatten_segments_for_chunking(rows, cfg=cfg, logger=logger)
         logger.info(f"doc_atoms doc_id={doc_id} atoms={len(atoms)}")
 
-        doc_chunks = chunk_atoms(atoms, max_chars=max_chars, overlap_chars=overlap_chars)
+        doc_chunks = chunk_atoms(atoms, max_chars=max_chars, overlap_chars=overlap)
         all_chunks.extend(doc_chunks)
 
         lens = [c["char_len"] for c in doc_chunks]
         st = stats_charlens(lens)
         too_short = sum(1 for x in lens if x < 200)
-        too_long = sum(1 for x in lens if x > max_chars + 200)  # с запасом на переносы/overlap
+        too_long = sum(1 for x in lens if x > max_chars + 200)  # с запасом на переносы
 
         logger.info(
             f"doc_done doc_id={doc_id} chunks={len(doc_chunks)} "
