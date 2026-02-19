@@ -774,6 +774,43 @@ def main() -> None:
                 temperature=0.1,
             ).strip()
 
+            # Second-try logic: if model returned NOT_FOUND despite having context,
+            # forbid NOT_FOUND and ask for EXTRACT/INFER using the same quotes.
+            is_nf = False
+            a0 = normalize_text(answer)
+            if a0 == "NOT_FOUND":
+                is_nf = True
+            else:
+                for _ln in (answer or "").splitlines():
+                    if "Режим:" in _ln and "NOT_FOUND" in _ln:
+                        is_nf = True
+                        break
+
+            if is_nf and quotes:
+                system2 = (
+                    system
+                    + " ВАЖНО: режим NOT_FOUND запрещён. Выбери EXTRACT или INFER. "
+                      "Отвечай строго по [Q..]. Если данных недостаточно для точного ответа, "
+                      "выбери INFER и явно укажи ограничения/что именно отсутствует."
+                )
+                answer2 = client.generate(
+                    model=llm_model,
+                    prompt=prompt,
+                    system=system2,
+                    temperature=0.1,
+                ).strip()
+
+                a2 = normalize_text(answer2)
+                is_nf2 = (a2 == "NOT_FOUND") or any(
+                    ("Режим:" in _ln and "NOT_FOUND" in _ln) for _ln in (answer2 or "").splitlines()
+                )
+
+                if not is_nf2:
+                    case_payload["notes"].append("second_try_triggered: replaced NOT_FOUND with EXTRACT/INFER")
+                    answer = answer2
+                else:
+                    case_payload["notes"].append("second_try_triggered: still NOT_FOUND")
+
             case_payload["answer"] = answer
 
             # Minimal format sanity checks (только пометки, не ломаем прогон)
