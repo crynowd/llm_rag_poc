@@ -30,17 +30,27 @@
     },
     "chunking": {
         "strategy": "document_aware",
-        "pdf_chunker": "llm",
+        "pdf_chunker": "heuristic",
         "pdf_llm_target_chars": 1200,
         "max_chars": 3500,
-        "overlap_chars": 250
+        "overlap_chars": 250,
+        "pdf_max_chars": 1500,
+        "pdf_overlap_chars": 200,
+        "docx_max_chars": 1600,
+        "docx_overlap_chars": 50,
+        "docx_chunker": "passages",
+        "passage_target_chars": 800,
+        "passage_min_sents": 2,
+        "passage_max_sents": 6,
+        "passage_overlap_sents": 1
+
     },
     "retrieval": {
-        "top_k": 6
+        "top_k": 10
     },
     "answering": {
         "not_found_policy": "low_retrieval_or_no_quote",
-        "min_similarity": 0.20,
-        "max_quote_chars": 800
+        "min_similarity": 0.00,
+        "max_quote_chars": 1200
     } 
 }

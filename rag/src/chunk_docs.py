@@ -9,25 +9,87 @@ import re
 
 # --- PDF sentence-based chunking helpers ---
 
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
 
 def split_into_sentences(text: str) -> List[str]:
-    """Naive sentence splitter for PDF text.
-
-    PDF is messy (numbering, abbreviations). We'll add a guardrail later.
-    """
     text = (text or "").strip()
     if not text:
         return []
     text = re.sub(r"\s+", " ", text).strip()
     sents = _SENT_SPLIT_RE.split(text)
-    out: List[str] = []
+    out = []
     for s in sents:
         s = s.strip()
         if len(s) >= 2:
             out.append(s)
     return out
+
+def build_passages_from_sentences(
+    sents: List[str],
+    target_chars: int = 800,
+    min_sents: int = 2,
+    max_sents: int = 6,
+    overlap_sents: int = 1,
+) -> List[str]:
+    """
+    Собираем пассажи из целых предложений.
+    Overlap задаётся в количестве предложений (чтобы не резать фразы).
+    """
+    passages: List[str] = []
+    n = len(sents)
+    i = 0
+
+    # защита от странных параметров
+    target_chars = max(200, int(target_chars))
+    min_sents = max(1, int(min_sents))
+    max_sents = max(min_sents, int(max_sents))
+    overlap_sents = max(0, int(overlap_sents))
+
+    while i < n:
+        buf: List[str] = []
+        buf_len = 0
+        j = i
+
+        # набираем предложения до target_chars и max_sents
+        while j < n and len(buf) < max_sents:
+            s = sents[j]
+            add_len = len(s) + (1 if buf else 0)
+
+            # если буфер пустой и одно предложение огромное — берём его как отдельный пассаж
+            if not buf and len(s) > target_chars:
+                buf = [s]
+                buf_len = len(s)
+                j += 1
+                break
+
+            # если уже набрали минимум предложений и следующее не влезает — стоп
+            if buf and buf_len + add_len > target_chars and len(buf) >= min_sents:
+                break
+
+            # иначе добавляем
+            buf.append(s)
+            buf_len += add_len
+            j += 1
+
+            # если достигли target_chars и уже есть минимум — стоп
+            if buf_len >= target_chars and len(buf) >= min_sents:
+                break
+
+        if not buf:
+            # чтобы не зациклиться
+            i += 1
+            continue
+
+        passages.append(" ".join(buf).strip())
+
+        # шаг вперёд с overlap
+        if overlap_sents > 0 and len(buf) > overlap_sents:
+            i = j - overlap_sents
+        else:
+            i = j
+
+    return passages
 
 
 def pack_sentences(sentences: List[str], max_chars: int, overlap_chars: int) -> List[str]:
@@ -154,8 +216,37 @@ def flatten_segments_for_chunking(
     pdf_max_chars = int(ch_cfg.get("pdf_max_chars", 1400))
     pdf_overlap_chars = int(ch_cfg.get("pdf_overlap_chars", 200))
 
+    # DOCX passage-mode (sentence windows)
+    docx_chunker = str(ch_cfg.get("docx_chunker", "document_aware")).lower()
+    passage_target_chars = int(ch_cfg.get("passage_target_chars", 800))
+    passage_min_sents = int(ch_cfg.get("passage_min_sents", 2))
+    passage_max_sents = int(ch_cfg.get("passage_max_sents", 6))
+    passage_overlap_sents = int(ch_cfg.get("passage_overlap_sents", 1))
+
     pdf_total = sum(1 for x in rows if x.get("doc_type") == "pdf")
     pdf_seen = 0
+
+    # If this is a DOCX and docx_chunker=passages, build passages per-document and return.
+    if rows and rows[0].get('doc_type') == 'docx' and docx_chunker == 'passages':
+        doc_id = rows[0].get('doc_id')
+        full = "\n".join([(x.get('text') or '').strip() for x in rows if (x.get('text') or '').strip()])
+        sents = split_into_sentences(full)
+        passages = build_passages_from_sentences(
+            sents,
+            target_chars=passage_target_chars,
+            min_sents=passage_min_sents,
+            max_sents=passage_max_sents,
+            overlap_sents=passage_overlap_sents,
+        )
+        for i, p in enumerate(passages, start=1):
+            if len(p.strip()) < 20:
+                continue
+            base = dict(rows[0])
+            base['text'] = p
+            base['para_idx'] = i
+            base['page'] = None
+            out.append(base)
+        return out
 
     for r in rows:
         txt = (r.get("text") or "").strip()
@@ -190,6 +281,39 @@ def flatten_segments_for_chunking(
 
 def make_chunk_id(doc_id: str, idx: int) -> str:
     return f"{doc_id}::{idx:05d}"
+
+
+def chunks_from_atoms_one_per_atom(
+    atoms: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Create one chunk per atom (used for DOCX passage-mode).
+    This avoids re-packing passages into larger chunks.
+    """
+    chunks: List[Dict[str, Any]] = []
+    idx = 0
+    for a in atoms:
+        t = (a.get('text') or '').strip()
+        if not t:
+            continue
+        doc_id = a['doc_id']
+        doc_type = a.get('doc_type')
+        source_path = a.get('source_path')
+        pages = [a.get('page')] if a.get('page') is not None else []
+        paras = [a.get('para_idx')] if a.get('para_idx') is not None else []
+        chunks.append({
+            'chunk_id': make_chunk_id(doc_id, idx),
+            'doc_id': doc_id,
+            'doc_type': doc_type,
+            'source_path': source_path,
+            'page_min': min(pages) if pages else None,
+            'page_max': max(pages) if pages else None,
+            'para_min': min(paras) if paras else None,
+            'para_max': max(paras) if paras else None,
+            'char_len': len(t),
+            'text': t,
+        })
+        idx += 1
+    return chunks
 
 
 def chunk_atoms(
@@ -324,12 +448,15 @@ def main() -> None:
             max_chars = max_chars_default
             overlap = overlap_default
 
-        logger.info(f"chunk_params doc_id={doc_id} doc_type={doc_type} max_chars={max_chars} overlap={overlap}")
+        logger.info(f"chunk_params doc_id={doc_id} doc_type={doc_type} max_chars={max_chars} overlap={overlap} docx_chunker={ch_cfg.get('docx_chunker', 'document_aware')}")
 
         atoms = flatten_segments_for_chunking(rows, cfg=cfg, logger=logger)
         logger.info(f"doc_atoms doc_id={doc_id} atoms={len(atoms)}")
 
-        doc_chunks = chunk_atoms(atoms, max_chars=max_chars, overlap_chars=overlap)
+        if doc_type == 'docx' and str(ch_cfg.get('docx_chunker', 'document_aware')).lower() == 'passages':
+            doc_chunks = chunks_from_atoms_one_per_atom(atoms)
+        else:
+            doc_chunks = chunk_atoms(atoms, max_chars=max_chars, overlap_chars=overlap)
         all_chunks.extend(doc_chunks)
 
         lens = [c["char_len"] for c in doc_chunks]

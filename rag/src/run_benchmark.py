@@ -5,9 +5,165 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import faiss  # type: ignore
-
+import re
+from collections import Counter, defaultdict
+import math
 from utils import load_json, load_jsonl, write_jsonl, make_run_dir, setup_logger
 from ollama_client import OllamaClient
+from quote_extractor import extract_best_quote
+
+_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+
+def bm25_tokenize(text: str) -> List[str]:
+    return _TOKEN_RE.findall((text or "").lower().replace("ё", "е"))
+
+def bm25_rerank(
+    query: str,
+    candidates: List[Tuple[str, float]],
+    chunk_text_by_id: Dict[str, str],
+    k: int,
+    alpha: float = 0.65,  # 0..1: 1 = только bm25, 0 = только similarity
+) -> List[Tuple[str, float]]:
+    """
+    Возвращает список (chunk_id, combined_score) длиной k.
+    candidates: (chunk_id, faiss_similarity)
+    """
+    if not candidates:
+        return []
+
+    q_tokens = bm25_tokenize(query)
+    if not q_tokens:
+        # нечем ранжировать по словам, оставляем как есть
+        return candidates[:k]
+
+    # строим "документы" на лету только для кандидатов
+    doc_tokens: List[List[str]] = []
+    doc_ids: List[str] = []
+    doc_lens: List[int] = []
+
+    for cid, sim in candidates:
+        toks = bm25_tokenize(chunk_text_by_id.get(cid, ""))
+        doc_tokens.append(toks)
+        doc_ids.append(cid)
+        doc_lens.append(len(toks))
+
+    N = len(doc_ids)
+    avgdl = (sum(doc_lens) / N) if N else 0.0
+    if avgdl == 0:
+        return candidates[:k]
+
+    # df(term)
+    df = defaultdict(int)
+    for toks in doc_tokens:
+        for t in set(toks):
+            df[t] += 1
+
+    # idf(term)
+    idf = {}
+    for t, dft in df.items():
+        # стандартная BM25 idf
+        idf[t] = math.log(1 + (N - dft + 0.5) / (dft + 0.5))
+
+    # BM25 params
+    k1 = 1.2
+    b = 0.75
+
+    # скоринг
+    bm25_scores = []
+    for toks, dl in zip(doc_tokens, doc_lens):
+        tf = Counter(toks)
+        score = 0.0
+        for t in q_tokens:
+            if t not in tf:
+                continue
+            f = tf[t]
+            denom = f + k1 * (1 - b + b * (dl / avgdl))
+            score += idf.get(t, 0.0) * (f * (k1 + 1) / denom)
+        bm25_scores.append(score)
+
+    # нормализация обоих скорингов в 0..1
+    sims = [sim for _, sim in candidates]
+    sim_min, sim_max = min(sims), max(sims)
+    bm_min, bm_max = min(bm25_scores), max(bm25_scores)
+
+    def norm(x, mn, mx):
+        if mx <= mn:
+            return 0.0
+        return (x - mn) / (mx - mn)
+
+    combined = []
+    for (cid, sim), bm in zip(candidates, bm25_scores):
+        s1 = norm(sim, sim_min, sim_max)
+        s2 = norm(bm, bm_min, bm_max)
+        combined_score = alpha * s2 + (1 - alpha) * s1
+        combined.append((cid, combined_score))
+
+    combined.sort(key=lambda x: x[1], reverse=True)
+    return combined[:k]
+
+def mmr_select(
+    candidates: List[Dict[str, Any]],
+    qvec: List[float],
+    emb: np.ndarray,
+    id_to_pos: Dict[str, int],
+    max_select: int,
+    lambda_mult: float = 0.7,
+) -> List[Dict[str, Any]]:
+    """
+    Maximal Marginal Relevance selection to diversify contexts.
+    Expects candidates sorted by relevance (higher is better).
+    Each candidate dict must contain: chunk_id, similarity (cosine).
+    """
+    if not candidates:
+        return []
+
+    q = np.array(qvec, dtype=np.float32)
+    q = q / (np.linalg.norm(q) + 1e-12)
+
+    selected: List[Dict[str, Any]] = []
+    selected_vecs: List[np.ndarray] = []
+
+    for _ in range(min(max_select, len(candidates))):
+        best_idx = -1
+        best_score = None
+
+        for i, c in enumerate(candidates):
+            if c.get("_picked"):
+                continue
+            cid = str(c["chunk_id"])
+            pos = id_to_pos.get(cid)
+            if pos is None:
+                continue
+            v = emb[pos]  # emb уже L2-нормализован
+            rel = float(c.get("similarity", 0.0))
+
+            if not selected_vecs:
+                mmr_score = rel
+            else:
+                max_red = max(float(np.dot(v, sv)) for sv in selected_vecs)
+                mmr_score = lambda_mult * rel - (1.0 - lambda_mult) * max_red
+
+            if best_score is None or mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = i
+
+        if best_idx < 0:
+            break
+
+        candidates[best_idx]["_picked"] = True
+        candidates[best_idx]["mmr_score"] = float(best_score) if best_score is not None else 0.0
+        selected.append(candidates[best_idx])
+
+        cid = str(candidates[best_idx]["chunk_id"])
+        pos = id_to_pos.get(cid)
+        if pos is not None:
+            selected_vecs.append(emb[pos])
+
+    for c in candidates:
+        if "_picked" in c:
+            del c["_picked"]
+
+    return selected
 
 
 def load_meta(meta_path: str) -> Dict[str, Dict[str, Any]]:
@@ -17,48 +173,59 @@ def load_meta(meta_path: str) -> Dict[str, Dict[str, Any]]:
     return meta
 
 
-def build_prompt(query: str, chunks: List[Dict[str, Any]]) -> Tuple[str, str]:
+def build_prompt(query: str, quotes: List[Dict[str, Any]]) -> Tuple[str, str]:
     """
     Возвращает (system, user_prompt).
-    Передаём в LLM НЕ "цитаты", а найденные ЧАНКИ (или их обрезанную часть).
+
+    Режимы:
+      - EXTRACT: в контексте есть явное правило/факт, который отвечает на вопрос
+      - INFER: прямой формулировки нет, но из контекста следует ответ (обобщение, частный случай, исключение)
+      - NOT_FOUND: только если контекст НЕ содержит ни правила, ни определения, ни ограничений,
+                   ни исключений, ни процедур, которые относятся к теме вопроса
     """
     system = (
         "Ты корпоративный ассистент по нормативным документам. "
-        "Ты ОБЯЗАН отвечать ТОЛЬКО на основе предоставленного контекста. "
-        "НЕЛЬЗЯ добавлять новые факты, интерпретации, предположения. "
-        "Если ответа нет в контексте, верни ровно: NOT_FOUND. "
-        "Не смешивай документы и редакции, используй только то, что дано."
+        "Ты ОБЯЗАН отвечать строго на основе контекста [Q..] и не добавлять факты извне. "
+        "Если в контексте есть хоть какая-то релевантная норма/ограничение/исключение/определение по теме вопроса, "
+        "ты НЕ ИМЕЕШЬ ПРАВА выбирать NOT_FOUND: выбери EXTRACT или INFER. "
+        "NOT_FOUND разрешён только когда контекст по теме вопроса пуст (нет релевантных норм/определений/ограничений). "
+        "Если выбираешь NOT_FOUND, ты обязан кратко объяснить, чего именно не хватает в контексте."
     )
 
     blocks: List[str] = []
-    for i, c in enumerate(chunks, start=1):
-        src = c["source"]
+    for i, q in enumerate(quotes, start=1):
+        src = q.get("source", {}) or {}
         blocks.append(
-            f"[C{i}] SOURCE: doc_id={src.get('doc_id')}; chunk_id={src.get('chunk_id')}; "
+            f"[Q{i}] SOURCE: doc_id={src.get('doc_id')}; chunk_id={src.get('chunk_id')}; "
             f"pages={src.get('pages')}; paras={src.get('paras')}\n"
-            f"CHUNK:\n{c.get('text','')}"
+            f"CONTEXT:\n{q.get('quote','')}"
         )
 
-    context = "\n\n".join(blocks)
+    context = "\n\n".join(blocks) if blocks else "(пусто)"
 
     user = f"""ВОПРОС:
 {query}
 
-КОНТЕКСТ (единственный источник истины):
+КОНТЕКСТ [Q..] (единственный источник истины):
 {context}
 
 ЗАДАНИЕ:
-1) Дай краткий ответ на русском.
-2) В конце укажи, какие фрагменты использовал: [C1], [C2]...
-3) Если в контексте нет прямого ответа на вопрос, верни ровно: NOT_FOUND.
-Формат:
+1) EXTRACT: если в контексте есть явная формулировка правила/факта/исключения, которая отвечает на вопрос.
+2) INFER: если прямой формулировки нет, но из контекста следует ответ (например, есть исключение, определение,
+   ограничение, процедура, или частный случай), сформулируй вывод и отметь "ВЫВОД".
+3) NOT_FOUND: только если контекст (Q..) по теме вопроса пуст. Если контекст содержит хотя бы частично релевантную норму,
+   определение, ограничение, исключение или процедуру, NOT_FOUND запрещён.
+
+ФОРМАТ (строго):
+- Режим: EXTRACT|INFER|NOT_FOUND
 - Ответ: ...
-- Основание: [C...]
+- Основание: [Q1], [Q2]...
 """
     return system, user
 
 
 def normalize_text(s: str) -> str:
+    # Для логов/сравнений: убираем лишние пробелы
     return " ".join((s or "").split()).strip()
 
 
@@ -76,6 +243,39 @@ def retrieve_candidates(
         if i < 0 or i >= len(ids):
             continue
         out.append((ids[i], float(score)))
+    return out
+
+
+def retrieve_within_doc(
+    ids: List[str],
+    emb: np.ndarray,
+    chunk_doc: Dict[str, Optional[str]],
+    qvec: List[float],
+    target_doc_id: str,
+) -> List[Tuple[str, float]]:
+    """Exact cosine-similarity search over ALL chunks of a single document.
+
+    Semantics of --restrict_doc should be: search within the target document,
+    not global-top then filter.
+    """
+    if not target_doc_id:
+        return []
+
+    doc_idx = [i for i, cid in enumerate(ids) if chunk_doc.get(cid) == target_doc_id]
+    if not doc_idx:
+        return []
+
+    q = np.array([qvec], dtype=np.float32)
+    faiss.normalize_L2(q)
+
+    M = emb[doc_idx]
+    scores = (M @ q.T).reshape(-1)
+
+    order = np.argsort(-scores)
+    out: List[Tuple[str, float]] = []
+    for j in order:
+        jj = int(j)
+        out.append((ids[doc_idx[jj]], float(scores[jj])))
     return out
 
 
@@ -107,22 +307,22 @@ def save_case_markdown(path: str, payload: Dict[str, Any]) -> None:
     lines.append(payload.get("answer", ""))
     lines.append("```")
     lines.append("")
-    lines.append("## Chunks passed to LLM")
+    lines.append("## Quotes passed to LLM")
     lines.append("")
-    chunks = payload.get("chunks", [])
-    if not chunks:
-        lines.append("_No chunks_")
+    quotes = payload.get("quotes", [])
+    if not quotes:
+        lines.append("_No quotes_")
     else:
-        for c in chunks:
-            src = c.get("source", {})
+        for q in quotes:
+            src = q.get("source", {})
             lines.append(
-                f"- **chunk_id:** `{c.get('chunk_id')}` | **doc_id:** `{src.get('doc_id')}` | "
+                f"- **chunk_id:** `{q.get('chunk_id')}` | **doc_id:** `{src.get('doc_id')}` | "
                 f"**pages:** `{src.get('pages')}` | **paras:** `{src.get('paras')}` | "
-                f"**sim:** {c.get('similarity'):.4f}"
+                f"**sim:** {q.get('similarity'):.4f} | **quote_score:** {q.get('quote_score'):.2f}"
             )
             lines.append("")
             lines.append("```")
-            lines.append((c.get("text", "") or "").strip())
+            lines.append(q.get("quote", "").strip())
             lines.append("```")
             lines.append("")
     lines.append("## Retrieval (top)")
@@ -158,31 +358,13 @@ def save_case_markdown(path: str, payload: Dict[str, Any]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", required=True, help="Path to cases.jsonl")
-    ap.add_argument(
-        "--doc_id",
-        default=None,
-        help="Restrict retrieval to a single document doc_id for ALL cases (variant A). "
-             "If set, overrides case.doc_id and enables restriction automatically.",
-    )
     ap.add_argument("--k", type=int, default=None, help="top_k retrieval (override config)")
-    ap.add_argument(
-        "--max_chunks",
-        type=int,
-        default=5,
-        help="How many chunks to pass to LLM (replaces max_quotes / quote_extractor).",
-    )
-    ap.add_argument(
-        "--max_chunk_chars",
-        type=int,
-        default=None,
-        help="Trim each chunk to at most this many characters before passing to LLM "
-             "(override answering.max_quote_chars if present).",
-    )
+    ap.add_argument("--max_quotes", type=int, default=3, help="How many quotes to pass to LLM")
     ap.add_argument("--limit", type=int, default=None, help="Limit number of cases to run")
     ap.add_argument(
         "--restrict_doc",
         action="store_true",
-        help="Restrict retrieved chunks to case.doc_id (or --doc_id override).",
+        help="Restrict retrieved chunks to case.doc_id (recommended for this benchmark)",
     )
     ap.add_argument(
         "--no_restrict_doc",
@@ -192,15 +374,57 @@ def main() -> None:
     ap.add_argument(
         "--k_search_multiplier",
         type=int,
-        default=50,
-        help="Retrieve k*k_search_multiplier candidates from FAISS before filtering (default raised).",
+        default=10,
+        help="Retrieve k*k_search_multiplier candidates from FAISS before filtering",
     )
     ap.add_argument(
         "--min_similarity",
         type=float,
         default=None,
-        help="Override answering.min_similarity from config (used only as a weak gate).",
+        help="Override answering.min_similarity from config",
     )
+    ap.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Enable hybrid reranking with BM25 over the candidate set",
+    )
+    ap.add_argument(
+        "--bm25_alpha",
+        type=float,
+        default=0.65,
+        help="Hybrid weight 0..1 (1=only BM25, 0=only similarity)",
+    )
+    ap.add_argument(
+    "--rerank_pool_multiplier",
+    type=int,
+    default=5,
+    help="Сколько кандидатов держать до rerank (множитель от top_k).",
+    )
+    ap.add_argument(
+        "--rerank_pool_min",
+        type=int,
+        default=100,
+        help="Минимальный размер пула кандидатов до rerank (если возможно).",
+    )
+    ap.add_argument(
+        "--mmr",
+        action="store_true",
+        help="Включить MMR-диверсификацию при выборе контекста для LLM.",
+    )
+    ap.add_argument(
+        "--mmr_lambda",
+        type=float,
+        default=0.7,
+        help="MMR lambda в [0..1]: больше -> релевантность, меньше -> разнообразие.",
+    )
+    ap.add_argument(
+        "--log_candidates",
+        type=int,
+        default=0,
+        help="Если >0, сохранять top-N кандидатов до/после rerank в results для дебага.",
+    )
+
+
     args = ap.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -221,41 +445,40 @@ def main() -> None:
         if args.min_similarity is not None
         else float(cfg["answering"]["min_similarity"])
     )
-    # Reuse existing config param as default trimming budget
-    cfg_trim = int(cfg.get("answering", {}).get("max_quote_chars", 1200))
-    max_chunk_chars = int(args.max_chunk_chars) if args.max_chunk_chars is not None else cfg_trim
+    max_quote_chars = int(cfg["answering"]["max_quote_chars"])
 
     restrict_doc = False
-    if args.doc_id:
-        restrict_doc = True
-    elif args.no_restrict_doc:
+    if args.no_restrict_doc:
         restrict_doc = False
     elif args.restrict_doc:
         restrict_doc = True
     else:
+        # дефолт: без ограничения, чтобы поведение соответствовало твоему текущему пайплайну
         restrict_doc = False
 
     logger.info("=== BENCHMARK RUN START ===")
     logger.info(f"run_dir={run_dir}")
     logger.info(f"cases_path={args.cases}")
-    logger.info(f"doc_id_override={args.doc_id}")
     logger.info(f"embed_model={embed_model} llm_model={llm_model}")
-    logger.info(f"top_k={top_k} max_chunks={args.max_chunks}")
-    logger.info(f"min_similarity={min_similarity} max_chunk_chars={max_chunk_chars}")
-    logger.info(f"restrict_doc={restrict_doc} k_search_multiplier={args.k_search_multiplier}")
+    logger.info(f"top_k={top_k} max_quotes={args.max_quotes}")
+    logger.info(f"min_similarity={min_similarity} max_quote_chars={max_quote_chars}")
+    logger.info(f"restrict_doc={restrict_doc}")
+    logger.info(f"hybrid={bool(args.hybrid)} bm25_alpha={float(args.bm25_alpha)}")
 
+    # snapshot config + args
     with open(os.path.join(run_dir, "run_args.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
                 "cases": args.cases,
-                "doc_id": args.doc_id,
                 "k": top_k,
-                "max_chunks": args.max_chunks,
-                "max_chunk_chars": max_chunk_chars,
+                "max_quotes": args.max_quotes,
                 "limit": args.limit,
                 "restrict_doc": restrict_doc,
                 "k_search_multiplier": args.k_search_multiplier,
                 "min_similarity": min_similarity,
+                "hybrid": bool(args.hybrid),
+                "bm25_alpha": float(args.bm25_alpha)
+            
             },
             f,
             ensure_ascii=False,
@@ -278,27 +501,35 @@ def main() -> None:
     with open(ids_path, "r", encoding="utf-8") as f:
         ids = [line.strip() for line in f if line.strip()]
     index = faiss.read_index(faiss_path)
+    # Load embeddings aligned with chunk_ids.txt (needed for exact within-doc search)
+    id_to_pos = {cid: i for i, cid in enumerate(ids)}
+    emb_path = os.path.join(index_dir, "embeddings.npy")
+    emb = np.load(emb_path).astype(np.float32)
+    faiss.normalize_L2(emb)
 
+    # Precompute chunk_id -> doc_id for filtering
     chunk_doc: Dict[str, Optional[str]] = {cid: meta.get(cid, {}).get("doc_id") for cid in ids}
 
+    # Load cases
     cases = load_jsonl(args.cases)
     if args.limit is not None:
         cases = cases[: max(0, int(args.limit))]
 
+    # init Ollama
     client = OllamaClient()
 
     out_rows: List[Dict[str, Any]] = []
     md_dir = os.path.join(run_dir, "cases_md")
     os.makedirs(md_dir, exist_ok=True)
 
-    # Pull lots of candidates before filtering (esp. for restrict_doc)
-    k_search = min(len(ids), max(top_k * int(args.k_search_multiplier), 500 if restrict_doc else top_k))
+    k_search = min(len(ids), max(top_k * int(args.k_search_multiplier), top_k))
+
     logger.info(f"cases_total={len(cases)} k_search={k_search}")
 
     for n, case in enumerate(cases, start=1):
         cid = case.get("id", f"case_{n:04d}")
         query = str(case.get("query", "")).strip()
-        target_doc_id = args.doc_id if args.doc_id else case.get("doc_id")
+        target_doc_id = case.get("doc_id")
         expect_nf = bool(case.get("expect_not_found", False))
 
         logger.info(f"[{n}/{len(cases)}] case_id={cid} target_doc_id={target_doc_id}")
@@ -311,25 +542,135 @@ def main() -> None:
             "gold": case.get("gold", {}),
             "gold_evidence": case.get("gold_evidence", {}),
             "retrieved": [],
-            "chunks": [],
+            "quotes": [],
             "answer": "",
             "status": "OK",
             "notes": [],
         }
 
         try:
+            # Embed query
             qvec = client.embed_one(embed_model, query)
 
-            retrieved_all = retrieve_candidates(index, ids, qvec, k_search)
-
-            retrieved = retrieved_all
+            # Retrieval
             if restrict_doc and target_doc_id:
-                retrieved = [(ch, sc) for (ch, sc) in retrieved_all if chunk_doc.get(ch) == target_doc_id]
-                if not retrieved:
-                    case_payload["notes"].append("No chunks after doc_id filter (strict restrict_doc).")
+                # True within-document search: score ALL chunks of the target document
+                retrieved = retrieve_within_doc(
+                    ids=ids, emb=emb, chunk_doc=chunk_doc, qvec=qvec, target_doc_id=target_doc_id
+                )
+            else:
+                # Global search over the whole corpus
+                retrieved = retrieve_candidates(index, ids, qvec, k_search)
 
-            retrieved = retrieved[:top_k]
+            # Optional hybrid rerank over the candidate set
+            # Build candidate pool BEFORE rerank (so rerank has room to work)
+            pool_size = max(int(args.rerank_pool_min), int(args.rerank_pool_multiplier) * int(top_k))
+            retrieved_pool = retrieved[:pool_size] if len(retrieved) > pool_size else retrieved
 
+            # Prepare verbose candidate list
+            candidates_pre: List[Dict[str, Any]] = []
+            for ch_id, sim in retrieved_pool:
+                m = meta.get(ch_id, {}) or {}
+                pages, paras = format_where(m)
+                candidates_pre.append(
+                    {
+                        "chunk_id": ch_id,
+                        "similarity": float(sim),
+                        "doc_id": m.get("doc_id"),
+                        "pages": pages,
+                        "paras": paras,
+                    }
+                )
+
+            # Hybrid rerank (BM25 + similarity)
+            candidates_post: List[Dict[str, Any]] = candidates_pre
+            if args.hybrid:
+                # BM25 over pool
+                docs_tokens = [bm25_tokenize(chunk_text_by_id.get(c["chunk_id"], "")) for c in candidates_pre]
+                k1 = 1.5
+                b = 0.75
+                N = len(docs_tokens)
+                df = Counter()
+                doc_lens = []
+                for toks in docs_tokens:
+                    doc_lens.append(len(toks))
+                    df.update(set(toks))
+                avgdl = (sum(doc_lens) / max(1, N)) if N else 0.0
+
+                def bm25_score(qtoks: List[str], idx: int) -> float:
+                    score = 0.0
+                    toks = docs_tokens[idx]
+                    if not toks:
+                        return 0.0
+                    tf = Counter(toks)
+                    dl = doc_lens[idx]
+                    for term in qtoks:
+                        if term not in tf:
+                            continue
+                        n_q = df.get(term, 0)
+                        idf = math.log(1.0 + (N - n_q + 0.5) / (n_q + 0.5))
+                        f = tf[term]
+                        denom = f + k1 * (1.0 - b + b * (dl / (avgdl + 1e-9)))
+                        score += idf * (f * (k1 + 1.0) / (denom + 1e-9))
+                    return score
+
+                q_toks = bm25_tokenize(query)
+                bm25_scores = [bm25_score(q_toks, i) for i in range(N)]
+                if bm25_scores:
+                    mn, mx = min(bm25_scores), max(bm25_scores)
+                    rng = (mx - mn) if (mx - mn) > 1e-9 else 1.0
+                    bm25_norm = [(s - mn) / rng for s in bm25_scores]
+                else:
+                    bm25_norm = [0.0 for _ in range(N)]
+
+                alpha = float(args.bm25_alpha)
+                tmp: List[Dict[str, Any]] = []
+                for i, c in enumerate(candidates_pre):
+                    sim = float(c.get("similarity", 0.0))
+                    b25 = float(bm25_norm[i])
+                    hybrid = alpha * b25 + (1.0 - alpha) * sim
+                    cc = dict(c)
+                    cc["bm25"] = b25
+                    cc["hybrid_score"] = hybrid
+                    tmp.append(cc)
+
+                tmp.sort(key=lambda x: x.get("hybrid_score", 0.0), reverse=True)
+                candidates_post = tmp
+            else:
+                candidates_post = sorted(candidates_pre, key=lambda x: x.get("similarity", 0.0), reverse=True)
+
+            # keep top_k after rerank
+            candidates_post = candidates_post[: int(top_k)]
+
+            # MMR diversification for contexts sent to LLM
+            if args.mmr:
+                selected_for_llm = mmr_select(
+                    candidates=candidates_post,
+                    qvec=qvec,
+                    emb=emb,
+                    id_to_pos=id_to_pos,
+                    max_select=max(1, int(args.max_quotes)),
+                    lambda_mult=float(args.mmr_lambda),
+                )
+            else:
+                selected_for_llm = candidates_post[: max(1, int(args.max_quotes))]
+
+            # store debug candidates if requested
+            if int(args.log_candidates) > 0:
+                Nlog = int(args.log_candidates)
+                case_payload["candidates_pre_rerank"] = candidates_pre[:Nlog]
+                case_payload["candidates_post_rerank"] = candidates_post[:Nlog]
+                case_payload["selected_for_llm"] = selected_for_llm
+
+            # Backward compatible 'retrieved' list (post-rerank)
+            retrieved = [(c["chunk_id"], float(c.get("similarity", 0.0))) for c in candidates_post]
+
+
+            if restrict_doc and target_doc_id:
+                doc_total = sum(1 for _cid in ids if chunk_doc.get(_cid) == target_doc_id)
+                case_payload["notes"].append(f"within_doc_total_chunks={doc_total} retrieved_len={len(retrieved)}")
+
+            # Save retrieval info
             for ch_id, sim in retrieved:
                 m = meta.get(ch_id, {})
                 pages, paras = format_where(m)
@@ -347,27 +688,60 @@ def main() -> None:
                     }
                 )
 
-            if not retrieved or retrieved[0][1] < min_similarity:
+            # NOT_FOUND if retrieval too weak
+            if not retrieved:
                 case_payload["answer"] = "NOT_FOUND"
                 case_payload["status"] = "NOT_FOUND_EMPTY_RETRIEVAL"
                 out_rows.append(case_payload)
                 save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
                 continue
 
-            # Pass full chunks (trimmed) to LLM, NO quote_extractor
-            chunks_for_llm: List[Dict[str, Any]] = []
-            for ch_id, sim in retrieved[: max(1, int(args.max_chunks))]:
+            # Similarity threshold is useful for global search, but for strict per-document runs
+            # it can hide relevant chunks simply because the doc is small/narrow.
+            if (not restrict_doc) and retrieved[0][1] < min_similarity:
+                case_payload["answer"] = "NOT_FOUND"
+                case_payload["status"] = "NOT_FOUND_BELOW_SIMILARITY_THRESHOLD"
+                out_rows.append(case_payload)
+                save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
+                continue
+
+            # Extract quotes
+            quotes: List[Dict[str, Any]] = []
+            for c in selected_for_llm:
+                ch_id = c["chunk_id"]
+                sim = float(c.get("similarity", 0.0))
                 full_text = chunk_text_by_id.get(ch_id, "") or ""
-                text = full_text.strip()
-                if max_chunk_chars and len(text) > max_chunk_chars:
-                    text = text[:max_chunk_chars].rstrip() + "\n…"
-                m = meta.get(ch_id, {})
+
+                qc = extract_best_quote(
+                    chunk_text=full_text,
+                    query=query,
+                    max_quote_chars=max_quote_chars,
+                    window_sentences=2,
+                )
+
+                quote_text = (qc.text or "").strip() if qc else ""
+                quote_score = float(getattr(qc, "score", 0.0)) if qc else 0.0
+                hit_words = list(getattr(qc, "hit_words", [])) if qc else []
+
+                # fallback: если extractor не нашёл цитату, всё равно даём кусок чанка
+                if not quote_text:
+                    quote_text = full_text.strip()[: int(max_quote_chars)]
+                    quote_score = 0.0
+                    hit_words = []
+
+                if not quote_text:
+                    continue
+
+                m = meta.get(ch_id, {}) or {}
                 pages, paras = format_where(m)
-                chunks_for_llm.append(
+
+                quotes.append(
                     {
                         "chunk_id": ch_id,
                         "similarity": float(sim),
-                        "text": text,
+                        "quote_score": float(quote_score),
+                        "hit_words": hit_words,
+                        "quote": quote_text,
                         "source": {
                             "doc_id": m.get("doc_id"),
                             "chunk_id": ch_id,
@@ -377,16 +751,22 @@ def main() -> None:
                     }
                 )
 
-            if not chunks_for_llm:
+            if not quotes:
                 case_payload["answer"] = "NOT_FOUND"
-                case_payload["status"] = "NOT_FOUND_NO_CHUNKS"
+                case_payload["status"] = "NOT_FOUND_NO_CONTEXT"
                 out_rows.append(case_payload)
                 save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
                 continue
 
-            case_payload["chunks"] = chunks_for_llm
 
-            system, prompt = build_prompt(query, chunks_for_llm)
+            # Pick best quotes: by similarity then quote_score
+            quotes.sort(key=lambda x: (x["similarity"], x["quote_score"]), reverse=True)
+            quotes = quotes[: max(1, int(args.max_quotes))]
+
+            case_payload["quotes"] = quotes
+
+            # Generate answer
+            system, prompt = build_prompt(query, quotes)
             answer = client.generate(
                 model=llm_model,
                 prompt=prompt,
@@ -396,12 +776,13 @@ def main() -> None:
 
             case_payload["answer"] = answer
 
+            # Minimal format sanity checks (только пометки, не ломаем прогон)
             a_norm = normalize_text(answer)
             if a_norm != "NOT_FOUND":
                 if "Основание:" not in answer:
                     case_payload["notes"].append("Answer missing 'Основание:' line (format drift).")
-                if "[C" not in answer:
-                    case_payload["notes"].append("Answer does not reference [C...] (format drift).")
+                if "[Q" not in answer:
+                    case_payload["notes"].append("Answer does not reference [Q...] (format drift).")
 
             out_rows.append(case_payload)
             save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
@@ -414,9 +795,11 @@ def main() -> None:
             save_case_markdown(os.path.join(md_dir, f"{cid}.md"), case_payload)
             logger.exception(f"case_id={cid} failed")
 
+    # Save outputs
     results_path = os.path.join(run_dir, "results.jsonl")
     write_jsonl(results_path, out_rows)
 
+    # A compact summary
     total = len(out_rows)
     n_ok = sum(1 for r in out_rows if r.get("status") == "OK")
     n_nf = sum(1 for r in out_rows if str(r.get("answer", "")).strip() == "NOT_FOUND")
